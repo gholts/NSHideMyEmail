@@ -30,17 +30,42 @@ static NSString *validLabel(NSString *value) {
     return value.length && [value rangeOfCharacterFromSet:NSCharacterSet.controlCharacterSet].location == NSNotFound ? value : nil;
 }
 
+static NSString *octagonPrimaryAltDSID(void) {
+    NSTask *task = [NSTask new];
+    task.executableURL = [NSURL fileURLWithPath:@"/usr/sbin/otctl"];
+    task.arguments = @[@"status", @"--json"];
+    NSPipe *output = [NSPipe pipe];
+    task.standardOutput = output;
+    task.standardError = NSFileHandle.fileHandleWithNullDevice;
+    if (![task launchAndReturnError:nil]) return nil;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 5 * NSEC_PER_SEC), dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+        if (task.running) [task terminate];
+    });
+    NSData *data = [output.fileHandleForReading readDataToEndOfFileAndReturnError:nil];
+    [task waitUntilExit];
+    if (task.terminationStatus != 0 || !data.length) return nil;
+    id report = [NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
+    NSString *account = [report isKindOfClass:NSDictionary.class] ? report[@"activeAccount"] : nil;
+    if (![account isKindOfClass:NSString.class]) return nil;
+    NSRange range = [account rangeOfString:@"(?<=^<TPSpecificUser: altDSID:)[^\\s()<>]+(?= o:\\S+ ck:\\S+ p:\\S*/primary aaID:.*>$)"
+                                   options:NSRegularExpressionSearch];
+    return range.location == NSNotFound ? nil : [account substringWithRange:range];
+}
+
 static NSString *primaryAltDSID(void) {
     NSString *identifier = NSProcessInfo.processInfo.environment[@"HME_ALT_DSID"];
     if (identifier.length) return identifier;
-    id manager = [NSClassFromString(@"AKAccountManager") sharedInstance];
+    Class managerClass = NSClassFromString(@"AKAccountManager");
+    id manager = [managerClass respondsToSelector:@selector(sharedInstance)] ? [managerClass sharedInstance] : nil;
     identifier = [manager respondsToSelector:@selector(altDSIDforPrimaryiCloudAccount)] ? [manager altDSIDforPrimaryiCloudAccount] : nil;
     if ([identifier isKindOfClass:NSString.class] && identifier.length) return identifier;
     NSURL *url = [NSFileManager.defaultManager.homeDirectoryForCurrentUser URLByAppendingPathComponent:@"Library/Preferences/MobileMeAccounts.plist"];
     NSArray *accounts = [NSDictionary dictionaryWithContentsOfURL:url error:nil][@"Accounts"];
-    if (![accounts isKindOfClass:NSArray.class] || accounts.count != 1 || ![accounts.firstObject isKindOfClass:NSDictionary.class]) return nil;
-    identifier = accounts.firstObject[@"AccountAlternateDSID"];
-    return [identifier isKindOfClass:NSString.class] && identifier.length ? identifier : nil;
+    if ([accounts isKindOfClass:NSArray.class] && accounts.count == 1 && [accounts.firstObject isKindOfClass:NSDictionary.class]) {
+        identifier = accounts.firstObject[@"AccountAlternateDSID"];
+        if ([identifier isKindOfClass:NSString.class] && identifier.length) return identifier;
+    }
+    return octagonPrimaryAltDSID();
 }
 
 static NSAlert *newAlert(void) {
@@ -98,12 +123,17 @@ static NSString *promptLabel(void) {
     self.window.releasedWhenClosed = NO;
     [self.window makeKeyAndOrderFront:nil];
 
-    NSError *error;
-    if (![self present:&error]) [self fail:error];
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        void *authKit = dlopen("/System/Library/PrivateFrameworks/AuthKit.framework/AuthKit", RTLD_NOW);
+        NSString *identifier = primaryAltDSID();
+        dispatch_async(dispatch_get_main_queue(), ^{
+            NSError *error;
+            if (![self presentWithAuthKit:authKit identifier:identifier error:&error]) [self fail:error];
+        });
+    });
 }
 
-- (BOOL)present:(NSError **)error {
-    void *authKit = dlopen("/System/Library/PrivateFrameworks/AuthKit.framework/AuthKit", RTLD_NOW);
+- (BOOL)presentWithAuthKit:(void *)authKit identifier:(NSString *)identifier error:(NSError **)error {
     void *authKitUI = dlopen("/System/Library/PrivateFrameworks/AuthKitUI.framework/AuthKitUI", RTLD_NOW);
     NSString *const __unsafe_unretained *origin = authKit ? (NSString *const __unsafe_unretained *)dlsym(authKit, "AKPrivateEmailOriginTypeThirdPartyApp") : NULL;
     Class contextClass = NSClassFromString(@"AKPrivateEmailContext");
@@ -116,12 +146,13 @@ static NSString *promptLabel(void) {
         *error = failure(@"Hide My Email isn't available on this version of macOS.");
         return NO;
     }
-    NSString *identifier = primaryAltDSID();
     if (!identifier.length) {
-        *error = failure(@"Sign in to iCloud on this Mac to use Hide My Email.");
+        *error = failure(@"Couldn't identify the primary iCloud account. Check Apple Account in System Settings or set HME_ALT_DSID.");
         return NO;
     }
-    id context = [[contextClass alloc] initWithKey:label altDSID:identifier originType:*origin originIdentifier:label];
+    NSString *domain = [label stringByReplacingOccurrencesOfString:@"\\s+" withString:@"-"
+        options:NSRegularExpressionSearch range:NSMakeRange(0, label.length)];
+    id context = [[contextClass alloc] initWithKey:domain altDSID:identifier originType:*origin originIdentifier:label];
     if (!context) {
         *error = failure(@"AuthKit rejected the request.");
         return NO;
